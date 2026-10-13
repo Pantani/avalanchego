@@ -22,7 +22,6 @@ import (
 	"github.com/ava-labs/avalanchego/graft/coreth/precompile/contracts/warp"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/upgrade"
-	"github.com/ava-labs/avalanchego/vms/evm/acp226"
 	"github.com/ava-labs/avalanchego/vms/saevm/cchain/cparams"
 	"github.com/ava-labs/avalanchego/vms/saevm/cchain/dynamic"
 	"github.com/ava-labs/avalanchego/vms/saevm/cchain/libevm/customtypes"
@@ -259,7 +258,7 @@ func (g *genesis) block() (*types.Block, error) {
 
 	if c.IsGranite(g.Timestamp) {
 		headerExtra.TimeMilliseconds = new(g.Timestamp * 1000)
-		headerExtra.MinDelayExcess = new(acp226.InitialDelayExcess)
+		headerExtra.MinDelayExcess = new(dynamic.InitialDelayExponent)
 	}
 
 	if c.IsHelicon(g.Timestamp) {

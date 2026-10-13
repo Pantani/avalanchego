@@ -15,7 +15,6 @@ import (
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/rlp"
 
-	"github.com/ava-labs/avalanchego/vms/evm/acp226"
 	"github.com/ava-labs/avalanchego/vms/evm/predicate"
 	"github.com/ava-labs/avalanchego/vms/saevm/cchain/dynamic"
 
@@ -46,7 +45,7 @@ type HeaderExtra struct {
 	ExtDataGasUsed   *big.Int                `rpc:"extDataGasUsed"`
 	BlockGasCost     *big.Int                `rpc:"blockGasCost"`
 	TimeMilliseconds *uint64                 `rpc:"timestampMilliseconds"`
-	MinDelayExcess   *acp226.DelayExcess     `rpc:"minDelayExcess"`
+	MinDelayExcess   *dynamic.DelayExponent  `rpc:"minDelayExcess"`
 	TargetExponent   *dynamic.TargetExponent `rpc:"targetExponent"`
 	MinPriceExponent *dynamic.PriceExponent  `rpc:"minPriceExponent"`
 
