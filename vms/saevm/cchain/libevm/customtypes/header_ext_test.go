@@ -26,7 +26,7 @@ import (
 func TestHeaderRLP(t *testing.T) {
 	t.Parallel()
 
-	got := testHeaderEncodeDecode(t, rlp.EncodeToBytes, rlp.DecodeBytes)
+	got := testHeaderEncodeDecode(t, rlp.EncodeToBytes, rlp.DecodeBytes, false)
 
 	// Golden data from original coreth implementation, before integration of
 	// libevm. WARNING: changing these values can break backwards compatibility
@@ -45,13 +45,14 @@ func TestHeaderJSON(t *testing.T) {
 
 	// Note we ignore the returned encoded bytes because we don't
 	// need to compare them to a JSON gold standard.
-	_ = testHeaderEncodeDecode(t, json.Marshal, json.Unmarshal)
+	_ = testHeaderEncodeDecode(t, json.Marshal, json.Unmarshal, true)
 }
 
 func testHeaderEncodeDecode(
 	t *testing.T,
 	encode func(any) ([]byte, error),
 	decode func([]byte, any) error,
+	withdrawalsHashEncoded bool, // RLP never carries it; JSON does
 ) (encoded []byte) {
 	t.Helper()
 
@@ -65,7 +66,9 @@ func testHeaderEncodeDecode(
 	gotExtra := GetHeaderExtra(gotHeader)
 
 	wantHeader, wantExtra := headerWithNonZeroFields()
-	wantHeader.WithdrawalsHash = nil
+	if !withdrawalsHashEncoded {
+		wantHeader.WithdrawalsHash = nil
+	}
 	require.Equal(t, wantHeader, gotHeader)
 	require.Equal(t, wantExtra, gotExtra)
 
@@ -147,54 +150,16 @@ func allFieldsSet[T interface {
 				if fieldValue.Kind() == reflect.Pointer {
 					require.Falsef(t, fieldValue.IsNil(), "field %q is nil", field.Name)
 				}
-				fieldValue = reflect.NewAt(fieldValue.Type(), unsafe.Pointer(fieldValue.UnsafeAddr())).Elem()
+				fieldValue = reflect.NewAt(fieldValue.Type(), unsafe.Pointer(fieldValue.UnsafeAddr())).Elem() //#nosec G103 -- reads unexported fields in a test
 			}
 
-			switch f := fieldValue.Interface().(type) {
-			case common.Hash:
-				assertNonZero(t, f)
-			case common.Address:
-				assertNonZero(t, f)
-			case types.BlockNonce:
-				assertNonZero(t, f)
-			case types.Bloom:
-				assertNonZero(t, f)
-			case uint32:
-				assertNonZero(t, f)
-			case uint64:
-				assertNonZero(t, f)
-			case *big.Int:
-				assertNonZero(t, f)
-			case *common.Hash:
-				assertNonZero(t, f)
-			case *uint64:
-				assertNonZero(t, f)
-			case *[]uint8:
-				assertNonZero(t, f)
-			case *types.Header:
-				assertNonZero(t, f)
-			case *acp226.DelayExcess:
-				assertNonZero(t, f)
-			case *dynamic.TargetExponent:
-				assertNonZero(t, f)
-			case *dynamic.PriceExponent:
-				assertNonZero(t, f)
-			case []uint8, []*types.Header, types.Transactions, []*types.Transaction, types.Withdrawals, []*types.Withdrawal:
-				require.NotEmpty(t, f)
-			default:
-				t.Fatalf("Field %q has unsupported type %T", field.Name, f)
+			if fieldValue.Kind() == reflect.Slice {
+				require.NotZerof(t, fieldValue.Len(), "field %q is empty", field.Name)
+			} else {
+				require.Falsef(t, fieldValue.IsZero(), "field %q is zero", field.Name)
 			}
 		})
 	}
-}
-
-func assertNonZero[T interface {
-	common.Hash | common.Address | types.BlockNonce | uint32 | uint64 | types.Bloom |
-		*big.Int | *common.Hash | *uint64 | *[]uint8 | *types.Header |
-		*acp226.DelayExcess | *dynamic.TargetExponent | *dynamic.PriceExponent
-}](t *testing.T, v T) {
-	t.Helper()
-	require.NotZero(t, v)
 }
 
 // Note [TestCopyHeader] tests the [HeaderExtra.PostCopy] method.
