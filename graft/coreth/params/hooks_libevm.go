@@ -15,7 +15,6 @@ import (
 	"github.com/ava-labs/libevm/libevm/legacy"
 
 	"github.com/ava-labs/avalanchego/graft/coreth/nativeasset"
-	"github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
 	"github.com/ava-labs/avalanchego/graft/coreth/precompile/contract"
 	"github.com/ava-labs/avalanchego/graft/coreth/precompile/contracts/warp"
 	"github.com/ava-labs/avalanchego/graft/coreth/precompile/precompileconfig"
@@ -23,6 +22,7 @@ import (
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/vms/evm/predicate"
 	"github.com/ava-labs/avalanchego/vms/saevm/cchain/cparams"
+	"github.com/ava-labs/avalanchego/vms/saevm/cchain/libevm/customtypes"
 	"github.com/ava-labs/avalanchego/vms/saevm/hook"
 
 	evmprecompileconfig "github.com/ava-labs/avalanchego/graft/evm/precompileconfig"

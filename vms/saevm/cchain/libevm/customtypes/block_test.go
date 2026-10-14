@@ -33,19 +33,21 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/ava-labs/avalanchego/vms/evm/acp226"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/math"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
-	ethparams "github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/ava-labs/libevm/trie"
+
+	"github.com/ava-labs/avalanchego/vms/evm/acp226"
+
+	ethparams "github.com/ava-labs/libevm/params"
 
 	// This test file has to be in package types_test to avoid a circular
 	// dependency when importing `params`. We dot-import the package to mimic
 	// regular same-package behaviour.
-	. "github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
+	. "github.com/ava-labs/avalanchego/vms/saevm/cchain/libevm/customtypes"
 )
 
 // This test has been modified from https://github.com/ethereum/go-ethereum/blob/v1.9.21/core/types/block_test.go#L35 to fit

@@ -14,9 +14,9 @@ import (
 	"github.com/ava-labs/libevm/params"
 	"github.com/holiman/uint256"
 
-	"github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
 	"github.com/ava-labs/avalanchego/graft/coreth/precompile/contract"
 	"github.com/ava-labs/avalanchego/vms/evm/predicate"
+	"github.com/ava-labs/avalanchego/vms/saevm/cchain/libevm/customtypes"
 
 	corethparams "github.com/ava-labs/avalanchego/graft/coreth/params"
 )
