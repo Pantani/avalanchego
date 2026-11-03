@@ -37,8 +37,10 @@ go_library(
 
 go_test(
     name = "firewood_test",
-    srcs = ["triedb_test.go"],
-    data = glob(["testdata/**"]),
+    srcs = [
+        "main_test.go",
+        "triedb_test.go",
+    ],
     embed = [":firewood"],
     deps = [
         "//utils",
@@ -57,5 +59,6 @@ go_test(
         "@com_github_holiman_uint256//:uint256",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@net_pgregory_rapid//:rapid",
     ],
 )

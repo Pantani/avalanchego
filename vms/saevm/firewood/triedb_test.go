@@ -4,8 +4,14 @@
 package firewood
 
 import (
+	"context"
+	"flag"
+	"fmt"
 	"math"
 	"math/big"
+	"os"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/ava-labs/libevm/common"
@@ -20,6 +26,7 @@ import (
 	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"pgregory.net/rapid"
 
 	"github.com/ava-labs/avalanchego/utils"
 	"github.com/ava-labs/avalanchego/utils/logging"
@@ -27,7 +34,7 @@ import (
 	"github.com/ava-labs/avalanchego/utils/set"
 )
 
-func newDB(t *testing.T) state.Database {
+func newDB(t testing.TB) state.Database {
 	t.Helper()
 
 	cfg := DefaultConfig(t.TempDir(), loggingtest.New(t, logging.Debug))
@@ -40,7 +47,7 @@ func newDB(t *testing.T) state.Database {
 	return db
 }
 
-func newStateDB(t *testing.T, db state.Database, root common.Hash) *state.StateDB {
+func newStateDB(t testing.TB, db state.Database, root common.Hash) *state.StateDB {
 	t.Helper()
 
 	sdb, err := state.New(root, db, nil)
@@ -58,7 +65,7 @@ type backend struct {
 	sdb *state.StateDB
 }
 
-func newBackend(t *testing.T, db state.Database) *backend {
+func newBackend(t testing.TB, db state.Database) *backend {
 	return &backend{
 		db:  db,
 		sdb: newStateDB(t, db, types.EmptyRootHash),
@@ -67,7 +74,7 @@ func newBackend(t *testing.T, db state.Database) *backend {
 
 // commit ends the current block, reopens a fresh StateDB at the new root and
 // returns that root.
-func (b *backend) commit(t *testing.T, blockNum uint64) common.Hash {
+func (b *backend) commit(t testing.TB, blockNum uint64) common.Hash {
 	t.Helper()
 	root, err := b.sdb.Commit(blockNum, true /* EIP-158 */)
 	require.NoErrorf(t, err, "%T.Commit()", b.sdb)
@@ -88,8 +95,6 @@ type account struct {
 }
 
 type SUT struct {
-	r *reader
-
 	want, got *backend
 
 	lastRoot common.Hash
@@ -104,9 +109,8 @@ type SUT struct {
 	destructedThisTx set.Set[common.Address] // eligible for resurrection
 }
 
-func newSUT(r *reader, want, got *backend) *SUT {
+func newSUT(want, got *backend) *SUT {
 	return &SUT{
-		r:                r,
 		want:             want,
 		got:              got,
 		lastRoot:         types.EmptyRootHash,
@@ -120,34 +124,30 @@ func hash(b byte) common.Hash {
 	return crypto.Keccak256Hash([]byte{b})
 }
 
-func (s *SUT) selectAddr(param byte) common.Address {
-	return s.addrs[int(param)%len(s.addrs)]
+func addrOf(p byte) common.Address {
+	return common.BytesToAddress(hash(p).Bytes())
 }
 
 // createAccount creates an account, modelling an EVM contract deployment. When
 // an account has been destructed earlier in the current transaction, that
 // accound could be resurrected.
 //
-// Reads 1 byte from the reader.
-//
 // The created account is EIP-168 empty, to encourage collisions in journal
 // handling and set states of deleted accounts.
 // To guarantee an account is persisted, one must also call
 // [SUT.updateAccount] or [SUT.setStorage] on the account.
-func (s *SUT) createAccount(t *testing.T) {
-	param := s.r.byte()
-	addr := common.BytesToAddress(hash(param).Bytes())
+func (s *SUT) createAccount(tb testing.TB, addr common.Address) {
 	if _, ok := s.accounts[addr]; ok {
-		t.Logf("skipping account creation (addr=%s) because it already exists", addr)
+		tb.Logf("skipping account creation (addr=%s) because it already exists", addr)
 		return
 	}
 	if s.destructedThisTx.Contains(addr) {
 		// The account was destructed earlier this tx, so this is a
 		// resurrection.
-		t.Logf("resurrecting destructed account (addr=%s)", addr)
+		tb.Logf("resurrecting destructed account (addr=%s)", addr)
 		s.destructedThisTx.Remove(addr)
 	} else {
-		t.Logf("creating new account (addr=%s)", addr)
+		tb.Logf("creating new account (addr=%s)", addr)
 	}
 
 	s.accounts[addr] = &account{
@@ -161,15 +161,8 @@ func (s *SUT) createAccount(t *testing.T) {
 	s.got.sdb.CreateAccount(addr)
 }
 
-// Reads 1 byte from the reader
-func (s *SUT) updateAccount(t *testing.T) {
-	if len(s.addrs) == 0 {
-		return
-	}
-
-	param := s.r.byte()
-	addr := s.selectAddr(param)
-	t.Logf("updating account (addr=%s)", addr)
+func (s *SUT) updateAccount(tb testing.TB, addr common.Address) {
+	tb.Logf("updating account (addr=%s)", addr)
 	acc := s.accounts[addr]
 	acc.nonce++
 	acc.balance = new(uint256.Int).Add(acc.balance, uint256.NewInt(1))
@@ -182,21 +175,11 @@ func (s *SUT) updateAccount(t *testing.T) {
 
 // selfDestruct6780 models the SELFDESTRUCT opcode under EIP-6780.
 //
-// Reads 1 byte from the reader.
-//
 // The call is always issued to the StateDB (it is a legal operation on any
 // account), but it only actually destructs the account — and so only updates
 // the model — when the account was created in the current transaction. On a
 // pre-existing account it is a no-op and the account remains live.
-func (s *SUT) selfDestruct6780() {
-	if len(s.addrs) == 0 {
-		return
-	}
-
-	param := s.r.byte()
-	i := int(param) % len(s.addrs)
-	addr := s.addrs[i]
-
+func (s *SUT) selfDestruct6780(addr common.Address) {
 	s.want.sdb.Selfdestruct6780(addr)
 	s.got.sdb.Selfdestruct6780(addr)
 
@@ -207,20 +190,12 @@ func (s *SUT) selfDestruct6780() {
 	delete(s.accounts, addr)
 	s.createdThisTx.Remove(addr)
 	s.destructedThisTx.Add(addr)
-	s.addrs = utils.DeleteIndex(s.addrs, i)
+	s.addrs = utils.DeleteIndex(s.addrs, slices.Index(s.addrs, addr))
 }
 
-// Reads 1 byte from the reader to select account, key, and value
-func (s *SUT) setStorage(t *testing.T) {
-	if len(s.addrs) == 0 {
-		return
-	}
-
-	param := s.r.byte()
-	addr := s.selectAddr(param)
-	t.Logf("setting storage for %s", addr)
-	key := hash(s.r.byte())
-	val := hash(s.r.byte())
+func (s *SUT) setStorage(tb testing.TB, addr common.Address, k, v byte) {
+	tb.Logf("setting storage for %s", addr)
+	key, val := hash(k), hash(v)
 	acc := s.accounts[addr]
 	acc.activeSlots = append(acc.activeSlots, key)
 
@@ -232,20 +207,11 @@ func (s *SUT) setStorage(t *testing.T) {
 	s.got.sdb.SetNonce(addr, acc.nonce)
 }
 
-// Reads 1 byte from the reader to select account and key
-func (s *SUT) deleteStorage() {
-	if len(s.addrs) == 0 {
-		return
-	}
-
-	addr := s.selectAddr(s.r.byte())
+// deleteStorage zeroes accounts[addr].activeSlots[slot], which must be in range.
+func (s *SUT) deleteStorage(addr common.Address, slot int) {
 	acc := s.accounts[addr]
-	if len(acc.activeSlots) == 0 {
-		return
-	}
-	i := int(s.r.byte()) % len(acc.activeSlots)
-	key := acc.activeSlots[i]
-	acc.activeSlots = utils.DeleteIndex(acc.activeSlots, i)
+	key := acc.activeSlots[slot]
+	acc.activeSlots = utils.DeleteIndex(acc.activeSlots, slot)
 
 	// To prevent cyclical roots (A -> B -> A), update nonce
 	acc.nonce++
@@ -255,34 +221,28 @@ func (s *SUT) deleteStorage() {
 	s.got.sdb.SetNonce(addr, acc.nonce)
 }
 
-// Reads 2 bytes from the reader to select account and key
-func (s *SUT) read(t *testing.T) {
-	if len(s.addrs) == 0 {
-		return
-	}
-
-	addr := s.selectAddr(s.r.byte())
+// read compares account fields and, if slot >= 0, the storage slot
+// accounts[addr].activeSlots[slot].
+func (s *SUT) read(tb testing.TB, addr common.Address, slot int) {
 	want, got := s.want.sdb, s.got.sdb
-	require.Equal(t, want.GetNonce(addr), got.GetNonce(addr), "nonce mismatch for %s", addr)
-	require.Equal(t, want.Exist(addr), got.Exist(addr), "existence mismatch for %s", addr)
-	require.Equal(t, want.Empty(addr), got.Empty(addr), "emptiness mismatch for %s", addr)
-	require.Equal(t, want.GetBalance(addr), got.GetBalance(addr), "balance mismatch for %s", addr)
+	require.Equal(tb, want.GetNonce(addr), got.GetNonce(addr), "nonce mismatch for %s", addr)
+	require.Equal(tb, want.Exist(addr), got.Exist(addr), "existence mismatch for %s", addr)
+	require.Equal(tb, want.Empty(addr), got.Empty(addr), "emptiness mismatch for %s", addr)
+	require.Equal(tb, want.GetBalance(addr), got.GetBalance(addr), "balance mismatch for %s", addr)
 	// [state.StateDB.GetStorageRoot] is known not to produce compatible
 	// outputs.
-	require.Equal(t, want.GetCode(addr), got.GetCode(addr), "code mismatch for %s", addr)
-	require.Equal(t, want.GetCodeSize(addr), got.GetCodeSize(addr), "code size mismatch for %s", addr)
-	require.Equal(t, want.GetCodeHash(addr), got.GetCodeHash(addr), "code hash mismatch for %s", addr)
-	require.Equal(t, want.HasSelfDestructed(addr), got.HasSelfDestructed(addr), "self-destruct mismatch for %s", addr)
+	require.Equal(tb, want.GetCode(addr), got.GetCode(addr), "code mismatch for %s", addr)
+	require.Equal(tb, want.GetCodeSize(addr), got.GetCodeSize(addr), "code size mismatch for %s", addr)
+	require.Equal(tb, want.GetCodeHash(addr), got.GetCodeHash(addr), "code hash mismatch for %s", addr)
+	require.Equal(tb, want.HasSelfDestructed(addr), got.HasSelfDestructed(addr), "self-destruct mismatch for %s", addr)
 
-	storage := s.accounts[addr].activeSlots
-	if len(storage) == 0 {
+	if slot < 0 {
 		return
 	}
-	i := int(s.r.byte()) % len(storage)
-	key := storage[i]
+	key := s.accounts[addr].activeSlots[slot]
 
-	require.Equal(t, want.GetState(addr, key), got.GetState(addr, key), "storage mismatch for %s[%s]", addr, key)
-	require.Equal(t, want.GetCommittedState(addr, key), got.GetCommittedState(addr, key), "committed storage mismatch for %s[%s]", addr, key)
+	require.Equal(tb, want.GetState(addr, key), got.GetState(addr, key), "storage mismatch for %s[%s]", addr, key)
+	require.Equal(tb, want.GetCommittedState(addr, key), got.GetCommittedState(addr, key), "committed storage mismatch for %s[%s]", addr, key)
 }
 
 // finaliseTx resets the model's per-transaction tracking to mirror
@@ -300,14 +260,14 @@ func (s *SUT) finalise() {
 	s.finaliseTx()
 }
 
-func (s *SUT) intermediateRoot(t *testing.T) {
+func (s *SUT) intermediateRoot(t testing.TB) {
 	want := s.want.sdb.IntermediateRoot(true /* EIP-158 */)
 	got := s.got.sdb.IntermediateRoot(true /* EIP-158 */)
 	require.Equal(t, want, got, "root mismatch")
 	s.finaliseTx() // IntermediateRoot calls Finalise
 }
 
-func (s *SUT) stateDBCommit(t *testing.T) {
+func (s *SUT) stateDBCommit(t testing.TB) {
 	want := s.want.commit(t, s.blockNum)
 	got := s.got.commit(t, s.blockNum)
 	require.Equal(t, want, got, "root mismatch after commit")
@@ -317,7 +277,7 @@ func (s *SUT) stateDBCommit(t *testing.T) {
 	s.finaliseTx() // Commit calls Finalise
 }
 
-func (s *SUT) diskCommit(t *testing.T) {
+func (s *SUT) diskCommit(t testing.TB) {
 	want, got := s.want.db, s.got.db
 	require.NoErrorf(t, want.TrieDB().Commit(s.lastRoot, false), "%T.TrieDB().Commit(%s)", want, s.lastRoot)
 	require.NoErrorf(t, got.TrieDB().Commit(s.lastRoot, false), "%T.TrieDB().Commit(%s)", got, s.lastRoot)
@@ -333,140 +293,157 @@ func (s *SUT) copyStateDB() {
 	s.got.copy()
 }
 
-// TODO(#5539): support [*state.StateDB.SelfDestruct]
-const (
-	opCreateAccount    byte = iota // deploy an account; resurrects a same-tx destructed account when one exists
-	opUpdateAccount                // increment nonce and balance of an existing account
-	opSelfDestruct6780             // SELFDESTRUCT (EIP-6780) an account; no-op unless created this tx
-	opSetStorage                   // write a new storage slot on an existing account
-	opDeleteStorage                // zero out an existing storage slot on an existing account
-	opRead                         // read an existing account's nonce and a storage slot
-	opFinalise                     // end the current transaction without computing a root
-	opIntermediateRoot             // verify all account and storage hashes match the model
-	opStateDBCommit                // commit pending changes; root changes iff state changed
-	opDiskCommit                   // flush pending, then commit a clean StateDB; root must be unchanged
-	opCopyStateDB                  // copies statedb for future ops
-	maxOp
-)
-
-type reader struct {
-	stream []byte
+// rapidTB binds the helpers' logging, failures and cleanups to the current
+// rapid check while keeping the outer test's TempDir.
+type rapidTB struct {
+	testing.TB
+	rt *rapid.T
 }
 
-func (r *reader) op() byte {
-	return r.byte() % maxOp
+func (b rapidTB) Helper()                    { b.rt.Helper() }
+func (b rapidTB) Log(args ...any)            { b.rt.Log(args...) }
+func (b rapidTB) Logf(f string, args ...any) { b.rt.Logf(f, args...) }
+func (b rapidTB) Error(args ...any)          { b.rt.Error(args...) }
+func (b rapidTB) Errorf(f string, args ...any) {
+	b.rt.Errorf(f, args...)
 }
-
-func (r *reader) byte() byte {
-	if len(r.stream) == 0 {
-		return 0
-	}
-	b := r.stream[0]
-	r.stream = r.stream[1:]
-	return b
+func (b rapidTB) Fatal(args ...any) { b.rt.Fatal(args...) }
+func (b rapidTB) Fatalf(f string, args ...any) {
+	b.rt.Fatalf(f, args...)
 }
+func (b rapidTB) FailNow()                 { b.rt.FailNow() }
+func (b rapidTB) Fail()                    { b.rt.Fail() }
+func (b rapidTB) Failed() bool             { return b.rt.Failed() }
+func (b rapidTB) Skip(args ...any)         { b.rt.Skip(args...) }
+func (b rapidTB) Context() context.Context { return b.rt.Context() }
 
-func (r *reader) empty() bool {
-	return len(r.stream) == 0
-}
-
-// FuzzStateRoot compares the state root of an arbitrary sequence of operations on
-// a Firewood-backed [state.StateDB] against a reference HashDB.
-func FuzzStateRoot(f *testing.F) {
-	tests := [][]byte{
-		{
-			opStateDBCommit,
-			opDiskCommit,
-		},
-		{
-			opCreateAccount, 0,
-			opStateDBCommit,
-			opDiskCommit,
-		},
-		{
-			opCreateAccount, 0,
-			opUpdateAccount, 0,
-			opStateDBCommit,
-			opDiskCommit,
-		},
-		{
-			opCreateAccount, 0,
-			opUpdateAccount, 0,
-			opSetStorage, 0, 1, 2,
-			opStateDBCommit,
-			opDiskCommit,
-		},
-		{
-			opCreateAccount, 0,
-			opSetStorage, 0, 1, 2,
-			opIntermediateRoot,
-			opDeleteStorage, 0 /*acct*/, 0, /*idx*/
-			opStateDBCommit,
-		},
-		{
-			opCreateAccount, 0,
-			opUpdateAccount, 0,
-			opFinalise,
-			opSelfDestruct6780, 0,
-			opStateDBCommit,
-		},
-		{
-			opCreateAccount, 0,
-			opSetStorage, 0, 1, 2,
-			opSelfDestruct6780, 0,
-			opCreateAccount, 1, // resurrects the just-destructed account
-			opSetStorage, 0, 1, 2,
-			opStateDBCommit,
-		},
-	}
-	for _, tt := range tests {
-		f.Add(tt)
-	}
-
-	f.Fuzz(func(t *testing.T, stream []byte) {
-		r := &reader{stream: stream}
-		sut := newSUT(r,
-			newBackend(t, state.NewDatabase(rawdb.NewMemoryDatabase())), // hashdb
-			newBackend(t, newDB(t)), // firewood
-		)
-		for !r.empty() {
-			switch r.op() {
-			case opCreateAccount:
-				t.Log("create account")
-				sut.createAccount(t)
-			case opUpdateAccount:
-				t.Log("update account")
-				sut.updateAccount(t)
-			case opSelfDestruct6780:
-				t.Log("delete account")
-				sut.selfDestruct6780()
-			case opSetStorage:
-				t.Log("set storage")
-				sut.setStorage(t)
-			case opDeleteStorage:
-				t.Log("delete storage")
-				sut.deleteStorage()
-			case opRead:
-				t.Log("read")
-				sut.read(t)
-			case opFinalise:
-				t.Log("finalise (end transaction)")
-				sut.finalise()
-			case opIntermediateRoot:
-				t.Log("intermediate root (end transaction)")
-				sut.intermediateRoot(t)
-			case opStateDBCommit:
-				t.Log("commit (end block)")
-				sut.stateDBCommit(t)
-			case opDiskCommit:
-				t.Log("disk commit (previous block)")
-				sut.diskCommit(t)
-			case opCopyStateDB:
-				t.Log("copy StateDB")
-				sut.copyStateDB()
-			}
+// Cleanup fails the check on errors raised during f, which rapid would
+// otherwise only notice after the property returns.
+func (b rapidTB) Cleanup(f func()) {
+	b.rt.Cleanup(func() {
+		already := b.rt.Failed()
+		f()
+		if !already && b.rt.Failed() {
+			b.rt.FailNow()
 		}
-		sut.intermediateRoot(t) // final flush to tries and verify all pending state
+	})
+}
+
+// TempDir is removed when the check ends, after cleanups registered later.
+func (b rapidTB) TempDir() string {
+	b.Helper()
+	dir, err := os.MkdirTemp(b.TB.TempDir(), "rapid")
+	if err != nil {
+		b.Fatalf("os.MkdirTemp(): %v", err)
+	}
+	b.rt.Cleanup(func() { assert.NoError(b.TB, os.RemoveAll(dir), "os.RemoveAll()") })
+	return dir
+}
+
+// TODO(#5539): support [*state.StateDB.SelfDestruct]
+func actions(tb testing.TB, s *SUT) map[string]func(*rapid.T) {
+	b15 := rapid.ByteMax(15)
+	addr := func(rt *rapid.T) common.Address {
+		if len(s.addrs) == 0 {
+			rt.Skip("no accounts")
+		}
+		return rapid.SampledFrom(s.addrs).Draw(rt, "addr")
+	}
+	return map[string]func(*rapid.T){
+		"createAccount": func(rt *rapid.T) {
+			s.createAccount(tb, addrOf(b15.Draw(rt, "p")))
+		},
+		"resurrectAccount": func(rt *rapid.T) {
+			if s.destructedThisTx.Len() == 0 {
+				rt.Skip("nothing destructed this tx")
+			}
+			destructed := s.destructedThisTx.List()
+			slices.SortFunc(destructed, common.Address.Cmp)
+			s.createAccount(tb, rapid.SampledFrom(destructed).Draw(rt, "addr"))
+		},
+		"updateAccount": func(rt *rapid.T) {
+			s.updateAccount(tb, addr(rt))
+		},
+		"selfDestruct6780": func(rt *rapid.T) {
+			s.selfDestruct6780(addr(rt))
+		},
+		"setStorage": func(rt *rapid.T) {
+			a := addr(rt)
+			s.setStorage(tb, a, b15.Draw(rt, "key"), b15.Draw(rt, "val"))
+		},
+		"deleteStorage": func(rt *rapid.T) {
+			var withSlots []common.Address
+			for _, a := range s.addrs {
+				if len(s.accounts[a].activeSlots) > 0 {
+					withSlots = append(withSlots, a)
+				}
+			}
+			if len(withSlots) == 0 {
+				rt.Skip("no slots")
+			}
+			a := rapid.SampledFrom(withSlots).Draw(rt, "addr")
+			n := len(s.accounts[a].activeSlots)
+			s.deleteStorage(a, rapid.IntRange(0, n-1).Draw(rt, "slot"))
+		},
+		"read": func(rt *rapid.T) {
+			a := addr(rt)
+			slot := -1
+			if n := len(s.accounts[a].activeSlots); n > 0 {
+				slot = rapid.IntRange(0, n-1).Draw(rt, "slot")
+			}
+			s.read(tb, a, slot)
+		},
+		"finalise":         func(*rapid.T) { s.finalise() },
+		"intermediateRoot": func(*rapid.T) { s.intermediateRoot(tb) },
+		"stateDBCommit":    func(*rapid.T) { s.stateDBCommit(tb) },
+		"diskCommit":       func(*rapid.T) { s.diskCommit(tb) },
+		"copyStateDB":      func(*rapid.T) { s.copyStateDB() },
+	}
+}
+
+// stateRootProp compares the state root of arbitrary operation sequences on a
+// Firewood-backed [state.StateDB] against a reference: HashDB, or when
+// reconstructed, a Firewood StateDB opened past the tip.
+func stateRootProp(tb testing.TB, reconstructed bool) func(*rapid.T) {
+	return func(rt *rapid.T) {
+		rtb := rapidTB{tb, rt}
+		var s *SUT
+		if reconstructed {
+			s = newSUT(newBackend(rtb, newDB(rtb)), newReconstructedBackend(rtb))
+		} else {
+			s = newSUT(
+				newBackend(rtb, state.NewDatabase(rawdb.NewMemoryDatabase())), // hashdb
+				newBackend(rtb, newDB(rtb)),                                   // firewood
+			)
+		}
+		acts := actions(rtb, s)
+		if reconstructed {
+			// Commits are not valid on a reconstructed state.
+			delete(acts, "stateDBCommit")
+			delete(acts, "diskCommit")
+		}
+		rt.Repeat(acts)
+		s.intermediateRoot(rtb) // final flush to tries and verify all pending state
+	}
+}
+
+func TestStateRoot(t *testing.T) {
+	rapid.Check(t, stateRootProp(t, false))
+}
+
+func TestReconstructedRoot(t *testing.T) {
+	rapid.Check(t, stateRootProp(t, true))
+}
+
+func FuzzStateRoot(f *testing.F) {
+	f.Fuzz(func(t *testing.T, b []byte) {
+		rapid.MakeFuzz(stateRootProp(t, false))(t, b)
+	})
+}
+
+func FuzzReconstructedRoot(f *testing.F) {
+	f.Fuzz(func(t *testing.T, b []byte) {
+		rapid.MakeFuzz(stateRootProp(t, true))(t, b)
 	})
 }
 
@@ -474,7 +451,7 @@ func FuzzStateRoot(f *testing.F) {
 // the empty root after the tip has moved past it. One MUST NOT call
 // [state.StateDB.Commit] or [triedb.Database.Commit] on it, as these are not
 // eligible operations.
-func newReconstructedBackend(t *testing.T) *backend {
+func newReconstructedBackend(t testing.TB) *backend {
 	db := newDB(t)
 
 	// The sdb address is never generated by the model
@@ -485,89 +462,6 @@ func newReconstructedBackend(t *testing.T) *backend {
 	require.NoErrorf(t, db.TrieDB().Commit(fillerRoot, false), "triedb.Commit(%s)", fillerRoot)
 
 	return newBackend(t, db)
-}
-
-func FuzzReconstructedRoot(f *testing.F) {
-	tests := [][]byte{
-		{
-			opCreateAccount, 0,
-			opUpdateAccount, 0,
-			opSetStorage, 0, 1, 2,
-			opRead, 0, 0,
-		},
-		{
-			opCreateAccount, 0,
-			opSetStorage, 0, 1, 2,
-			opIntermediateRoot,
-			opDeleteStorage, 0 /*acct*/, 0, /*idx*/
-			opRead, 0, 0,
-		},
-		{
-			opCreateAccount, 0,
-			opUpdateAccount, 0,
-			opFinalise,
-			opSelfDestruct6780, 0,
-		},
-		{
-			opCreateAccount, 0,
-			opSetStorage, 0, 1, 2,
-			opSelfDestruct6780, 0,
-			opCreateAccount, 1, // resurrects the just-destructed account
-			opSetStorage, 0, 3, 4,
-			opIntermediateRoot,
-			opRead, 0, 0,
-		},
-		{
-			opCreateAccount, 0,
-			opUpdateAccount, 0,
-			opIntermediateRoot,
-			opCopyStateDB,
-			opSetStorage, 0, 1, 2,
-			opIntermediateRoot,
-		},
-	}
-	for _, test := range tests {
-		f.Add(test)
-	}
-
-	f.Fuzz(func(t *testing.T, stream []byte) {
-		r := &reader{stream: stream}
-		sut := newSUT(r, newBackend(t, newDB(t)), newReconstructedBackend(t))
-		for !r.empty() {
-			// [state.StateDB.Commit] andn [triedb.Database.Commit] are not valid
-			// options for a reconstructed state, and aren't included below.
-			switch r.op() {
-			case opCreateAccount:
-				t.Log("create account")
-				sut.createAccount(t)
-			case opUpdateAccount:
-				t.Log("update account")
-				sut.updateAccount(t)
-			case opSelfDestruct6780:
-				t.Log("delete account")
-				sut.selfDestruct6780()
-			case opSetStorage:
-				t.Log("set storage")
-				sut.setStorage(t)
-			case opDeleteStorage:
-				t.Log("delete storage")
-				sut.deleteStorage()
-			case opRead:
-				t.Log("read")
-				sut.read(t)
-			case opFinalise:
-				t.Log("finalise (end transaction)")
-				sut.finalise()
-			case opIntermediateRoot:
-				t.Log("intermediate root (end transaction)")
-				sut.intermediateRoot(t)
-			case opCopyStateDB:
-				t.Log("copy StateDB")
-				sut.copyStateDB()
-			}
-		}
-		sut.intermediateRoot(t) // final flush to tries and verify all pending state
-	})
 }
 
 func TestGenesis(t *testing.T) {
@@ -1018,4 +912,150 @@ func TestHashAfterRevisionEviction(t *testing.T) {
 
 	_, err = sdb.Commit(2, true)
 	require.ErrorIs(t, err, errHistoricalNotCommittable, "Commit()")
+}
+
+func TestStateRootRegressions(t *testing.T) {
+	tests := []struct {
+		name  string
+		steps func(t *testing.T, s *SUT)
+	}{
+		{
+			// testdata/fuzz/FuzzStateRoot/test
+			name: "slot_rewritten_to_original_value_across_commits",
+			steps: func(t *testing.T, s *SUT) {
+				s.createAccount(t, addrOf(50))
+				s.updateAccount(t, addrOf(50))
+				s.createAccount(t, addrOf(48))
+				s.setStorage(t, addrOf(50), 48, 48)
+				for _, p := range []byte{49, 57, 55, 65} {
+					s.createAccount(t, addrOf(p))
+				}
+				s.stateDBCommit(t)
+				s.setStorage(t, addrOf(50), 48, 49)
+				s.createAccount(t, addrOf(56))
+				s.stateDBCommit(t)
+				s.setStorage(t, addrOf(50), 48, 48)
+				s.stateDBCommit(t)
+			},
+		},
+		{
+			name: "resurrect_in_same_tx",
+			steps: func(t *testing.T, s *SUT) {
+				s.createAccount(t, addrOf(0))
+				s.setStorage(t, addrOf(0), 1, 2)
+				s.selfDestruct6780(addrOf(0))
+				s.createAccount(t, addrOf(0))
+				s.setStorage(t, addrOf(0), 3, 4)
+			},
+		},
+		{
+			// testdata/fuzz/FuzzStateRoot/4b9a6df5b9d02d03
+			name: "copy_between_storage_writes",
+			steps: func(t *testing.T, s *SUT) {
+				s.createAccount(t, addrOf(48))
+				s.finalise()
+				s.setStorage(t, addrOf(48), 55, 48)
+				s.copyStateDB()
+				s.intermediateRoot(t)
+				s.setStorage(t, addrOf(48), 50, 56)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newSUT(
+				newBackend(t, state.NewDatabase(rawdb.NewMemoryDatabase())), // hashdb
+				newBackend(t, newDB(t)), // firewood
+			)
+			tt.steps(t, s)
+			s.intermediateRoot(t)
+		})
+	}
+}
+
+// failRecorder records failures instead of propagating them to the outer test.
+type failRecorder struct {
+	testing.TB
+	failed bool
+	errs   []string
+	logs   []string
+}
+
+func (r *failRecorder) Error(...any) { r.failed = true }
+func (r *failRecorder) Errorf(f string, a ...any) {
+	r.failed = true
+	r.errs = append(r.errs, fmt.Sprintf(f, a...))
+}
+func (r *failRecorder) Log(a ...any)            { r.logs = append(r.logs, fmt.Sprint(a...)) }
+func (r *failRecorder) Logf(f string, a ...any) { r.logs = append(r.logs, fmt.Sprintf(f, a...)) }
+func (r *failRecorder) Fatal(...any)            { r.failed = true }
+func (r *failRecorder) Fatalf(string, ...any)   { r.failed = true }
+func (r *failRecorder) Fail()                   { r.failed = true }
+func (r *failRecorder) FailNow()                { r.failed = true }
+func (r *failRecorder) Failed() bool            { return r.failed }
+
+// noFailFile stops rapid writing fail files for deliberate failures.
+func noFailFile(t *testing.T) {
+	t.Helper()
+	prev := flag.Lookup("rapid.nofailfile").Value.String()
+	require.NoError(t, flag.Set("rapid.nofailfile", "true"), "flag.Set()")
+	t.Cleanup(func() { assert.NoError(t, flag.Set("rapid.nofailfile", prev), "flag.Set()") })
+}
+
+func TestRapidTBRoutesFailures(t *testing.T) {
+	t.Run("cleanup_runs_per_check", func(t *testing.T) {
+		var checks, cleaned int
+		rapid.Check(t, func(rt *rapid.T) {
+			checks++
+			rapidTB{TB: t, rt: rt}.Cleanup(func() { cleaned++ })
+		})
+		require.Equal(t, checks, cleaned, "rapidTB.Cleanup calls")
+	})
+	t.Run("tempdir_removed_per_check", func(t *testing.T) {
+		var dirs []string
+		rapid.Check(t, func(rt *rapid.T) {
+			dirs = append(dirs, rapidTB{TB: t, rt: rt}.TempDir())
+		})
+		require.NotEmpty(t, dirs, "TempDir calls")
+		for _, d := range dirs {
+			require.NoDirExists(t, d, "rapidTB.TempDir() after check")
+		}
+	})
+	t.Run("cleanup_error_fails_check", func(t *testing.T) {
+		noFailFile(t)
+		rec := &failRecorder{TB: t}
+		rapid.Check(rec, func(rt *rapid.T) {
+			tb := rapidTB{TB: t, rt: rt}
+			tb.Cleanup(func() { tb.Errorf("boom") })
+		})
+		require.True(t, rec.failed, "rapid.Check reported the cleanup error")
+		out := strings.Join(rec.errs, "\n")
+		require.Contains(t, out, "[rapid] failed after", "failure marker")
+		require.Contains(t, strings.Join(rec.logs, "\n"), "boom", "cleanup error logged")
+		require.NotContains(t, out, "flaky", "cleanup error must fail the check deterministically")
+		require.False(t, t.Failed(), "outer t untouched")
+	})
+	t.Run("property_failure_survives_cleanups", func(t *testing.T) {
+		noFailFile(t)
+		rec := &failRecorder{TB: t}
+		rapid.Check(rec, func(rt *rapid.T) {
+			tb := rapidTB{TB: t, rt: rt}
+			for range 6 {
+				tb.Cleanup(func() {})
+			}
+			rt.Fatalf("property bug")
+		})
+		require.True(t, rec.failed, "rapid.Check reported the property failure")
+		require.Contains(t, strings.Join(rec.errs, "\n"), "property bug", "failure output")
+		require.False(t, t.Failed(), "outer t untouched")
+	})
+	t.Run("log_error_fails_check", func(t *testing.T) {
+		noFailFile(t)
+		rec := &failRecorder{TB: t}
+		rapid.Check(rec, func(rt *rapid.T) {
+			loggingtest.New(rapidTB{TB: t, rt: rt}, logging.Debug).Error("boom")
+		})
+		require.True(t, rec.failed, "rapid.Check reported the logged error")
+		require.False(t, t.Failed(), "outer t untouched")
+	})
 }
