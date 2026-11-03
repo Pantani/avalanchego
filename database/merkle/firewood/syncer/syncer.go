@@ -8,7 +8,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/ava-labs/firewood-go-ethhash/ffi"
+	"github.com/ava-labs/firewood-go/ffi"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -45,6 +45,7 @@ func New(
 ) (*sync.Syncer[*RangeProof, struct{}], error) {
 	return newWithDB(
 		config,
+		db,
 		&database{db},
 		targetRoot,
 		proofClient,
@@ -53,6 +54,7 @@ func New(
 
 func newWithDB(
 	config Config,
+	firewoodDB *ffi.Database,
 	db sync.DB[*RangeProof, struct{}],
 	targetRoot ids.ID,
 	proofClient *peertracker.Client,
@@ -69,7 +71,7 @@ func newWithDB(
 	return sync.NewSyncer(
 		db,
 		sync.Config[*RangeProof, struct{}]{
-			RangeProofMarshaler:   rangeProofMarshaler{},
+			RangeProofMarshaler:   rangeProofMarshaler{db: firewoodDB},
 			ChangeProofMarshaler:  changeProofMarshaler{},
 			EmptyRoot:             ids.ID(types.EmptyRootHash),
 			ProofClient:           proofClient,
@@ -121,10 +123,7 @@ func (db *database) CommitRangeProof(_ context.Context, start, end maybe.Maybe[[
 		return maybe.Nothing[[]byte](), nil
 	}
 
-	nextKey := nextKeyRange.StartKey()
-	if err := nextKeyRange.Free(); err != nil {
-		return maybe.Nothing[[]byte](), err
-	}
+	nextKey := nextKeyRange.StartKey
 
 	// TODO: This will eventually be handled by `FindNextKey`.
 	if (end.HasValue() && bytes.Compare(nextKey, end.Value()) > 0) || (start.HasValue() && bytes.Equal(nextKey, start.Value())) {
